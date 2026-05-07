@@ -3,7 +3,8 @@ from typing import Any
 
 import numpy as np
 import torch
-from einops import reduce
+import torch.nn.functional as F
+from einops import einsum, reduce
 
 from config import Config
 from model import CASunGroup
@@ -86,6 +87,58 @@ class SunUpdateFeature(Feature):
         )
 
 
+class ResourceFeature(Feature):
+    """Manages per-cell resources: regrowth, diffusion, and NCA consumption."""
+
+    def __init__(self, config: Config):
+        self.n_resources = config.n_resources
+        self.carrying_capacity = config.resource_carrying_capacity
+        self.regrowth_rate = config.resource_regrowth_rate
+        self.diffusion = config.resource_diffusion
+        self.consumption_rate = config.resource_consumption_rate
+        self.alive_dim = config.alive_dim
+        self.cell_state_dim = config.cell_state_dim
+
+    def on_init(self, world):
+        resource_dim = self.cell_state_dim // 2
+        world.resources = torch.full(
+            (world.pool_size, self.n_resources, *world.config.grid_size),
+            self.carrying_capacity,
+            device=world.device,
+            dtype=world.dtype,
+        )
+        vecs = torch.randn(self.n_resources, resource_dim, device=world.device)
+        if self.n_resources <= resource_dim:
+            Q, _ = torch.linalg.qr(vecs.T)
+            world.resource_vectors = Q[:, : self.n_resources].T.to(world.dtype)
+        else:
+            world.resource_vectors = F.normalize(vecs, dim=-1).to(world.dtype)
+
+    def before_step(self, world):
+        pool_idxs = world.state["pool_idxs"]
+        batch_res = world.resources[pool_idxs].clone()
+        batch_res = batch_res + self.regrowth_rate * (self.carrying_capacity - batch_res)
+        if self.diffusion > 0:
+            diffused = F.avg_pool2d(batch_res, 3, stride=1, padding=1)
+            batch_res = (1 - self.diffusion) * batch_res + self.diffusion * diffused
+        world.resources[pool_idxs] = batch_res
+        world.state["batch_resources"] = batch_res
+
+    def after_step(self, world, grid):
+        pool_idxs = world.state["pool_idxs"]
+        batch_res = world.resources[pool_idxs].clone()
+        att_end = self.alive_dim + self.cell_state_dim // 2
+        attack = grid[:, self.alive_dim : att_end].float()
+        attack_norm = F.normalize(attack, dim=1)
+        res_norm = F.normalize(world.resource_vectors.float(), dim=-1)
+        cos_aff = einsum(attack_norm, res_norm, "b c h w, r c -> b r h w")
+        total_alive = grid[:, 1 : self.alive_dim].sum(dim=1, keepdim=True).float()
+        consumption = self.consumption_rate * cos_aff.clamp(0, 1) * total_alive
+        batch_res = (batch_res.float() - consumption).clamp(0, self.carrying_capacity).to(world.dtype)
+        world.resources[pool_idxs] = batch_res
+        world.state["batch_resources"] = None
+
+
 class UpdatePoolWithNondeadFeature(Feature):
     """
     Goes through and updates pool with any runs which doesn't have a NCA which died out
@@ -155,6 +208,10 @@ class World:
         # Run all the before steps of the features
         for feature in self.features:
             feature.before_step(self)
+
+        # Sync resource state onto group so _run_competition_parallel can read it
+        group.current_resources = self.state.get("batch_resources")
+        group.resource_vectors = getattr(self, "resource_vectors", None)
 
         # Calculations
         steps_before = self.state.get("steps_before_update", 0)
@@ -294,6 +351,9 @@ class World:
 
         if config.sun_update_epoch_wait > 0:
             features.append(SunUpdateFeature(config))
+
+        if config.n_resources > 0:
+            features.append(ResourceFeature(config))
 
         if config.mode == "train":
             features.append(UpdatePoolWithNondeadFeature(config))

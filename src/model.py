@@ -255,6 +255,11 @@ class CASunGroup:
         )
 
         self.per_hid_upd = config.per_hid_upd
+        self.resource_strength_weight = config.resource_strength_weight
+
+        # Set by world.step each epoch when n_resources > 0
+        self.current_resources = None
+        self.resource_vectors = None
 
         # TRACKING STATS
         self.inter = None
@@ -397,6 +402,16 @@ class CASunGroup:
             self.str_add_idx[touching_ncas],
             "n i b h w, i m -> n m b h w",
         )
+
+        # Resource bonus: NCAs aligned with locally abundant resources gain territory strength
+        if self.current_resources is not None and self.resource_vectors is not None:
+            att_norm = F.normalize(all_attacks, dim=3)  # [N, M, B, C_att, H, W]
+            res_norm = F.normalize(self.resource_vectors, dim=-1)  # [R, C_att]
+            cos_aff = einsum(att_norm, res_norm, "n m b c h w, r c -> n m b r h w")
+            resource_bonus = einsum(
+                cos_aff, self.current_resources, "n m b r h w, b r h w -> n m b h w"
+            )
+            strengths = strengths + self.resource_strength_weight * resource_bonus
 
         # Apply alive mask to this!
         strengths = strengths.masked_fill(~alive_mask, -torch.inf)

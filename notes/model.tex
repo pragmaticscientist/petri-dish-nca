@@ -1,0 +1,361 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{booktabs}
+\usepackage{microtype}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Res}{\mathbf{R}}
+\newcommand{\vatt}{\mathbf{v}^{\mathrm{att}}}
+\newcommand{\vdef}{\mathbf{v}^{\mathrm{def}}}
+\newcommand{\fvec}{\mathbf{f}}
+\newcommand{\F}{\mathbf{F}}
+\newcommand{\cosim}[2]{\cos\!\left(#1,\,#2\right)}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{\textbf{Adversarial Neural Cellular Automata}\\
+\large Mathematical Model and Implementation}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\bigskip
+
+% ============================================================
+\section{Overview}
+% ============================================================
+
+This document gives a formal description of the \emph{adversarial Neural Cellular Automata} (NCA) simulation. The system places $N$ independently parameterised NCA agents on a shared two-dimensional grid of size $H \times W$. Each agent seeks to maximise its territorial coverage while competing against all other agents via a bilinear attack-defense mechanism resolved by cosine similarity. A special non-learning entity called the \emph{sun} acts as a neutral background competitor. An optional resource layer introduces ecological niche dynamics that can drive character displacement between co-occurring agents.
+
+% ============================================================
+\section{State Representation}
+% ============================================================
+
+\subsection{Cell Tensor}
+
+The global grid state at any time is a tensor
+\[
+    \mathbf{X} \in \R^{B \times C \times H \times W},
+\]
+where $B$ is the batch size (number of simultaneously evolved worlds) and
+\[
+    C \;=\; \underbrace{(N+1)}_{\text{alive}} + \underbrace{C_s}_{\text{state}} + \underbrace{C_h}_{\text{hidden}}
+    \;=\; C_{\mathrm{alive}} + C_s + C_h.
+\]
+We refer to the three channel blocks as follows.
+
+\paragraph{Alive channels $(\text{indices }0\ldots N)$.}
+Channel 0 is the sun's aliveness; channels $1,\ldots,N$ are the aliveness scores of NCAs $1,\ldots,N$. For every cell $(b,x,y)$, the alive vector $\mathbf{a}_{x,y} \in [0,1]^{N+1}$ satisfies $\sum_{m=0}^{N} a_{m,x,y} = 1$ at all times (see \cref{sec:territory}).
+
+\paragraph{State channels $(\text{indices }N+1\ldots N+C_s)$.}
+The state vector $\mathbf{s}_{x,y} \in \R^{C_s}$ is further split in half:
+\[
+    \mathbf{s}_{x,y} = \bigl(\underbrace{\vatt_{x,y}}_{\in\R^{C_s/2}},\; \underbrace{\vdef_{x,y}}_{\in\R^{C_s/2}}\bigr).
+\]
+The \emph{attack vector} $\vatt_{x,y}$ encodes the agent's offensive strategy, while the \emph{defense vector} $\vdef_{x,y}$ encodes its defensive posture. Both are shared across all NCAs occupying the same cell; individual NCA identities are tracked through the alive channels.
+
+\paragraph{Hidden channels $(\text{indices }N+C_s+1\ldots C-1)$.}
+The hidden vector $\mathbf{h}_{x,y} \in \R^{C_h}$ carries internal memory invisible to opponents when $\texttt{alive\_visible}=\texttt{False}$.
+
+\begin{remark}
+    The integer $C_s$ is required to be even so that attack and defense vectors have equal dimension $C_s/2$.
+\end{remark}
+
+\subsection{Perspectives}
+
+Each training step operates on a \emph{perspectives tensor}
+\[
+    \mathbf{X}^{\mathrm{persp}} \in \R^{(N+1) \times B \times C \times H \times W},
+\]
+where the leading dimension indexes the $N+1$ entities (sun at index 0, then NCAs $1,\ldots,N$). All perspectives share the same cell values but carry separate computational graphs so that gradient isolation between agents is maintained: perspective $n$ holds live gradients only for entity $n$'s parameters, while contributions from all other entities are detached.
+
+% ============================================================
+\section{Neural Network Architecture}
+% ============================================================
+
+\subsection{Merged Convolutional Model}
+
+All $N$ NCAs are realised by a single \texttt{MergedCAModel} using grouped convolutions so that each agent maintains entirely independent weights despite sharing a forward pass.
+
+\paragraph{Input.} When $\texttt{alive\_visible} = \texttt{True}$ the full cell tensor $\mathbf{X}$ of dimension $C$ is used; otherwise only the state and hidden channels of dimension $C_s + C_h$ are fed to the network.
+
+\paragraph{Architecture.} Let $D_\mathrm{in} \in \{C,\, C_s+C_h\}$ be the input width and $D_h$ the hidden width. The model consists of three stages applied to a flattened batch of shape $((N+1) \cdot B,\, D_\mathrm{in},\, H,\, W)$ (sun is excluded from the neural pass; see \cref{sec:sun}):
+
+\begin{enumerate}
+    \item \textbf{Encode.} A shared $k\times k$ convolution (no groups) projects $D_\mathrm{in} \to N \cdot D_h$ channels, followed by GELU activation and optional dropout:
+    \[
+        \mathbf{Z}^{(0)} = \mathrm{GELU}\!\left(\mathrm{Conv}_{k\times k}(\mathbf{X}_{\mathrm{in}})\right) \in \R^{NB \times N D_h \times H \times W}.
+    \]
+    \item \textbf{Reasoning.} $L$ residual blocks, each consisting of a grouped $k\times k$ convolution (groups $= N$) so that NCA $n$'s features interact only with themselves:
+    \[
+        \mathbf{Z}^{(\ell+1)} = \mathbf{Z}^{(\ell)} + \mathrm{GELU}\!\left(\mathrm{GroupConv}_{k\times k}^{(N)}(\mathbf{Z}^{(\ell)})\right), \quad \ell = 0,\ldots,L-1.
+    \]
+    \item \textbf{Compress.} A grouped $1\times 1$ convolution (groups $= N$) projects $ND_h \to N \cdot C_\mathrm{out}$ where $C_\mathrm{out} = C_s + C_h$, followed by Tanh activation to bound updates in $[-1,1]$:
+    \[
+        \hat{\mathbf{U}} = \tanh\!\left(\mathrm{GroupConv}_{1\times 1}^{(N)}(\mathbf{Z}^{(L)})\right) \in \R^{NB \times N C_\mathrm{out} \times H \times W}.
+    \]
+\end{enumerate}
+
+\paragraph{Output.} The result is reshaped to $\hat{\mathbf{U}} \in \R^{(N+1) \times N \times B \times C_\mathrm{out} \times H \times W}$, where the first index is the perspective and the second is the proposing entity.
+
+\subsection{Partial Hidden Update}
+
+A hyperparameter $\rho \in (0,1]$ controls the fraction of hidden channels each NCA may modify per step. For NCA $n$, the wrapping window $\{n \cdot \lfloor \rho C_h \rfloor, \ldots, (n+1)\lfloor \rho C_h \rfloor - 1\} \pmod{C_h}$ determines which hidden indices receive gradients from NCA $n$; all others are zeroed out in $\hat{\mathbf{U}}$.
+
+\subsection{Sun Entity}
+\label{sec:sun}
+
+The sun is a learnable vector
+\[
+    \mathbf{u}^{\odot} \in \R^{C_\mathrm{out}}, \qquad u^{\odot}_i = 0 \text{ for all hidden indices},
+\]
+normalised to unit norm at initialisation. It is broadcast to all spatial locations and all perspectives without passing through the convolutional network. The sun is trained with a separate AdamW optimiser and its gradient step is optionally skipped for the first $T_{\odot}$ epochs, allowing the NCAs to establish territory before the background force adapts.
+
+% ============================================================
+\section{Competition and Territory Assignment}
+\label{sec:territory}
+% ============================================================
+
+\subsection{Alive Mask}
+
+An entity $m$ is considered \emph{alive} at cell $(x,y)$ if there exists a cell in the $3\times 3$ neighbourhood of $(x,y)$ where its aliveness exceeds a threshold $\theta = 0.4$:
+\[
+    \alpha_{m,x,y} = \mathbf{1}\!\left[\max_{(x',y')\in\mathcal{N}(x,y)} a_{m,x',y'} > \theta \right] \in \{0,1\}.
+\]
+The sun is always alive everywhere: $\alpha_{0,x,y} = 1$ for all $(x,y)$. Only alive entities participate in competition at each cell.
+
+\subsection{Pairwise Cosine Strengths}
+
+Let $\mathcal{E} = \{(m,m') : m \neq m', m,m' \in \{0,\ldots,N\}\}$ be the set of ordered pairs of distinct entities. For each pair $(m,m') \in \mathcal{E}$, the \emph{raw pairwise advantage} of $m$ attacking $m'$ at cell $(x,y)$, as seen from perspective $n$, is
+\[
+    c_{n,(m,m'),x,y}
+    = \cosim{\vatt_{n,m,x,y}}{\vdef_{n,m',x,y}},
+\]
+where the attack and defense vectors are extracted from the proposed update $\hat{\mathbf{U}}_{n,m}$ of entity $m$ as seen by perspective $n$.
+
+\subsection{Aggregate Territory Strength}
+
+The \emph{territory strength} of entity $m$ at cell $(x,y)$ under perspective $n$ aggregates its pairwise advantages against all alive opponents:
+\[
+    \sigma_{n,m,x,y}
+    = \sum_{\substack{m' \neq m \\ \alpha_{m,x,y}\,\alpha_{m',x,y}=1}}
+    \Bigl[\cosim{\vatt_{n,m,x,y}}{\vdef_{n,m',x,y}}
+    - \cosim{\vatt_{n,m',x,y}}{\vdef_{n,m,x,y}}\Bigr].
+\]
+The second term penalises entity $m$ proportionally to how effectively its opponents can attack it, making the competition genuinely adversarial.
+
+\subsection{First-Pass Aliveness Assignment}
+
+Dead entities receive $\sigma_{n,m,x,y} = -\infty$. The preliminary aliveness allocation is given by the softmax over alive entities:
+\[
+    \tilde{a}_{n,m,x,y}
+    = \frac{\exp\!\left(\sigma_{n,m,x,y}\right)}
+           {\sum_{m'':\,\alpha_{m'',x,y}=1} \exp\!\left(\sigma_{n,m'',x,y}\right)}.
+\]
+
+\subsection{Survival Threshold and Renormalisation}
+
+A second alive mask is computed from the preliminary assignment. Any entity whose $3\times3$-neighbourhood maximum of $\tilde{a}$ falls below $\theta$ is killed:
+\[
+    \alpha'_{m,x,y} = \mathbf{1}\!\left[\max_{(x',y')\in\mathcal{N}(x,y)} \tilde{a}_{m,x',y'} > \theta \right].
+\]
+The surviving alivenesses are renormalised:
+\[
+    a_{m,x,y} = \frac{\tilde{a}_{m,x,y}\,\alpha'_{m,x,y}}
+                     {\sum_{m''} \tilde{a}_{m'',x,y}\,\alpha'_{m'',x,y}},
+\]
+ensuring that $\sum_m a_{m,x,y} = 1$ everywhere.
+
+\subsection{State Update}
+
+The cell's state and hidden channels are updated as a strength-weighted sum of all proposed updates:
+\[
+    \mathbf{s}_{x,y}^{\mathrm{new}} = \mathbf{s}_{x,y}
+    + \sum_{m=0}^{N} \tilde{a}_{n,m,x,y}\,\hat{\mathbf{U}}_{n,m,x,y},
+\]
+clipped to $[-1, 1]$ component-wise.
+
+\subsection{Softmax Temperature}
+
+A global temperature $\tau > 0$ rescales all strengths before the final aliveness softmax, controlling how ``winner-take-all'' the competition is. Smaller $\tau$ concentrates territory; larger $\tau$ produces more blended boundaries.
+
+% ============================================================
+\section{Training Objective}
+% ============================================================
+
+\subsection{Per-Entity Loss}
+
+The objective for each entity $m \in \{0,\ldots,N\}$ is to maximise the total aliveness it occupies across the batch. A soft logarithmic reward is used for numerical stability and to smooth gradients near zero:
+\[
+    \mathcal{L}_m = -\frac{1}{B} \sum_{b=1}^{B} \sinh^{-1}\!\left(\sum_{x,y} a_{m,x,y}^{(b)} + \varepsilon\right),
+\]
+where $\varepsilon = 10^{-3}$. The overall loss is the sum across all entities:
+\[
+    \mathcal{L} = \sum_{m=0}^{N} \mathcal{L}_m.
+\]
+
+\begin{remark}
+    Because perspective $n$ carries live gradients only for entity $n$, the backpropagation of $\mathcal{L}_n$ through $a_{n,m,x,y}$ updates only entity $n$'s parameters despite a single shared backward call.
+\end{remark}
+
+\subsection{Optimiser and Gradient Clipping}
+
+Each NCA is trained with an RMSProp (or AdamW) optimiser. Before each parameter update, gradient norms are clipped to a maximum value of $1.0$ to prevent instability:
+\[
+    \mathbf{g} \leftarrow \mathbf{g} \cdot \min\!\left(1,\; \frac{1.0}{\norm{\mathbf{g}}}\right).
+\]
+
+% ============================================================
+\section{Training Environment}
+% ============================================================
+
+\subsection{Grid Pool}
+
+To avoid over-fitting to a single initial condition, a pool of $P$ grid states is maintained. At each epoch a mini-batch of $B \leq P$ grids is sampled uniformly at random. After the epoch, grids in which every NCA survived (no extinction) are written back to the pool, maintaining diverse training states.
+
+\subsection{Initialisation}
+
+Each pool entry is initialised with all cells assigned to the sun ($a_{0,x,y} = 1$). Each NCA $n$ is then seeded at $S$ randomly chosen scatter locations, where its aliveness is set to $1$ and the sun's aliveness is set to $0$. The initial state values at seed locations are sampled from the unit sphere in $\R^{C_\mathrm{out}}$.
+
+\subsection{Burn-In Schedule}
+
+To allow NCAs to first develop local strategies before being subjected to long rollouts, the number of gradient steps per epoch $T_{\mathrm{per}}$ and burn-in steps $T_{\mathrm{before}}$ are incremented from initial values toward their targets over a configurable number of warm-up epochs. Concretely, $T_{\mathrm{per}}$ increases by a fixed increment every $E_{\mathrm{inc}}$ epochs until it reaches $T_{\mathrm{per}}^{\star}$, and similarly for $T_{\mathrm{before}}$.
+
+% ============================================================
+\section{Resource Dynamics and Niche Competition}
+% ============================================================
+
+This section describes the optional resource mechanic. When enabled (i.e., when the number of resource types $K > 0$), the simulation maintains a separate resource tensor and incorporates resource-derived bonuses into the territory strength computation. The mechanism is designed to create fitness niches that reward diversity in attack strategies and thereby provide a selective pressure for character displacement.
+
+\subsection{Resource Tensor and Fingerprints}
+
+Resources live in a tensor
+\[
+    \Res \in \R^{B \times K \times H \times W},
+\]
+separate from the cell tensor. There are $K$ resource types, each associated with a fixed \emph{fingerprint vector} $\fvec_k \in \R^{C_s/2}$ that lives in the same space as the attack vector. The fingerprints are assembled into a matrix $\F \in \R^{K \times C_s/2}$ and are chosen to be orthonormal when $K \leq C_s/2$:
+\[
+    \F\F^\top = \mathbf{I}_K.
+\]
+In practice, $\F$ is obtained by sampling a random Gaussian matrix and computing its QR decomposition. When $K > C_s/2$, the rows are instead $\ell_2$-normalised independently.
+
+\subsection{Resource Regrowth and Diffusion}
+
+At the beginning of each epoch, the resource amounts undergo \emph{logistic regrowth} toward a carrying capacity $\kappa$:
+\[
+    R_{k,x,y} \;\leftarrow\; R_{k,x,y} + \alpha\,(\kappa - R_{k,x,y}),
+\]
+where $\alpha \in (0,1)$ is the regrowth rate. Optionally, spatial diffusion with coefficient $\delta \in [0,1)$ is applied by averaging over the $3\times 3$ neighbourhood:
+\[
+    R_{k,x,y} \;\leftarrow\; (1 - \delta)\,R_{k,x,y} + \delta\,\overline{R}_{k,x,y},
+    \qquad \overline{R}_{k,x,y} = \frac{1}{9}\sum_{(x',y')\in\mathcal{N}(x,y)} R_{k,x',y'}.
+\]
+Resources are initialised to $\kappa$ and are clamped to $[0, \kappa]$ at all times.
+
+\subsection{Resource Consumption}
+
+After each epoch, living NCAs consume resources proportional to their \emph{cosine affinity} with the resource fingerprint and to the total NCA aliveness at that cell:
+\[
+    R_{k,x,y} \;\leftarrow\; R_{k,x,y}
+    - \beta\;\max\!\bigl(0,\,\cosim{\vatt_{x,y}}{\fvec_k}\bigr)\cdot A_{x,y},
+\]
+where
+\[
+    A_{x,y} = \sum_{m=1}^{N} a_{m,x,y}
+\]
+is the total NCA aliveness (sun excluded) and $\beta > 0$ is the consumption rate. Only positive affinities drive consumption: an NCA whose attack vector is orthogonal or anti-aligned to fingerprint $k$ does not deplete resource $k$. The resulting resource values are clamped to $[0,\kappa]$.
+
+\subsection{Resource Bonus in Territory Strength}
+
+At each simulation step, the territory strength of entity $m$ at cell $(x,y)$ under perspective $n$ is augmented by a \emph{resource bonus}:
+\[
+    \rho_{n,m,x,y}
+    = \sum_{k=1}^{K} R_{k,x,y}\cdot
+    \cosim{\vatt_{n,m,x,y}}{\fvec_k}.
+\]
+The bonus rewards entities whose attack vector is aligned with locally abundant resource fingerprints. The final strength used for territory assignment is
+\[
+    \tilde{\sigma}_{n,m,x,y}
+    = \sigma_{n,m,x,y} + \lambda\,\rho_{n,m,x,y},
+\]
+where $\lambda > 0$ is the \texttt{resource\_strength\_weight} hyperparameter. This modified strength $\tilde{\sigma}$ replaces $\sigma$ in all subsequent softmax computations described in \cref{sec:territory}.
+
+\subsection{Character Displacement Dynamics}
+
+Consider two NCAs with orthogonal resource fingerprints $\fvec_0 \perp \fvec_1$. When the two NCAs co-exist in the same region (\emph{sympatry}), each depletes its preferred resource locally, reducing the bonus for its competitor. Gradient descent then pushes the competitor's attack vector toward the other fingerprint — a \emph{negative frequency-dependent selection} dynamic.
+
+More formally, the gradient of the resource bonus with respect to NCA $m$'s attack vector $\vatt_m$ has a component
+\[
+    \frac{\partial \rho_{n,m,x,y}}{\partial \vatt_{m}}
+    \propto \sum_{k} R_{k,x,y}\,
+    \frac{\partial}{\partial \vatt_m}
+    \cosim{\vatt_m}{\fvec_k},
+\]
+which points toward whichever fingerprint $\fvec_k$ has the highest locally available resource. When NCA $m$ depletes resource $k$, this gradient reverses direction for its competitor, driving divergence in attack-vector space.
+
+\subsection{Configuration Parameters}
+
+\begin{center}
+\begin{tabular}{llp{7cm}}
+    \toprule
+    Parameter & Default & Description \\
+    \midrule
+    \texttt{n\_resources} & $0$ & Number of resource types $K$ (0 = disabled) \\
+    \texttt{resource\_carrying\_capacity} & $1.0$ & Maximum resource amount $\kappa$ \\
+    \texttt{resource\_regrowth\_rate} & $0.1$ & Regrowth rate $\alpha$ per epoch \\
+    \texttt{resource\_diffusion} & $0.0$ & Spatial diffusion coefficient $\delta$ \\
+    \texttt{resource\_consumption\_rate} & $0.1$ & Consumption rate $\beta$ per epoch \\
+    \texttt{resource\_strength\_weight} & $1.0$ & Resource bonus weight $\lambda$ \\
+    \bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Summary of Notation}
+% ============================================================
+
+\begin{center}
+\begin{tabular}{lp{10cm}}
+    \toprule
+    Symbol & Meaning \\
+    \midrule
+    $N$ & Number of NCA agents \\
+    $B$ & Batch size \\
+    $H, W$ & Grid height and width \\
+    $C_s$ & State channel dimension (must be even) \\
+    $C_h$ & Hidden channel dimension \\
+    $C = N+1+C_s+C_h$ & Total cell channel dimension \\
+    $C_\mathrm{out} = C_s + C_h$ & Model output dimension (state + hidden) \\
+    $D_h$ & Hidden width of the convolutional network \\
+    $k$ & Convolutional kernel size \\
+    $L$ & Number of residual reasoning blocks \\
+    $\theta$ & Aliveness survival threshold (0.4) \\
+    $\tau$ & Softmax temperature \\
+    $\varepsilon$ & Numerical stabiliser in loss ($10^{-3}$) \\
+    $K$ & Number of resource types \\
+    $\kappa$ & Resource carrying capacity \\
+    $\alpha$ & Resource regrowth rate \\
+    $\delta$ & Resource diffusion coefficient \\
+    $\beta$ & Resource consumption rate \\
+    $\lambda$ & Resource bonus weight \\
+    $\F \in \R^{K \times C_s/2}$ & Resource fingerprint matrix ($\F\F^\top = \mathbf{I}_K$) \\
+    \bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

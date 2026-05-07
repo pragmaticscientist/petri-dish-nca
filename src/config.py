@@ -54,6 +54,14 @@ class Config:
     log_every: int = 100
     wandb: bool = False
 
+    # Resources
+    n_resources: int = 0
+    resource_carrying_capacity: float = 1.0
+    resource_regrowth_rate: float = 0.1
+    resource_diffusion: float = 0.0
+    resource_consumption_rate: float = 0.1
+    resource_strength_weight: float = 1.0
+
     # Sun
     sun_update_epoch_wait: int = 0
 
